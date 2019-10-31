@@ -1,0 +1,237 @@
+# MIT License. See LICENSE.txt
+# Copyright (c) 2019 Maksim Aniskov MaksimAniskov@gmail.com
+
+---
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  This solution demonstrates SSH access to an EC2 instance
+  that is not configured with EC2 Key Pair (= SSH private key),
+  has no ports open to the public Internet,
+  or even has no public IP address, NAT gateway, and so on.
+  The solution leverages SSM Session Manager and EC2 Instance Connect.
+  Read more at https://github.com/MaksimAniskov/aws-ssh-bastion-ssm
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: ""
+      Parameters:
+      - SetupType
+    - Label:
+        default: EC2 Instance
+      Parameters:
+      - InstanceType
+      - InstanceAmiId
+    - Label:
+        default: Network
+      Parameters:
+      - VpcCidr
+      - SubnetCidr
+
+    ParameterLabels:
+      InstanceType:
+        default: Instance Type
+      SetupType:
+        default: Mode
+      VpcCidr:
+        default: VPC CIDR
+      SubnetCidr:
+        default: Subnet CIDR
+      InstanceAmiId:
+        default: Instance AMI Id, or reference to SSM Parameter containing the value
+
+Parameters:
+
+  SetupType:
+    Type: String
+    AllowedValues:
+      - public
+      - private
+    Default: public
+    Description: >
+      'public' creates a public subnet, and an EC2 instance with public IPv4 address.
+      'private' demonstrates access to instance in a private subnet,
+      but this mode requires creating 4 VPC endpoints, which implies additional costs.
+      See https://docs.aws.amazon.com/systems-manager/latest/userguide/setup-create-vpc.html
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: ((\d{1,3})\.){3}\d{1,3}/\d{1,2}
+
+  SubnetCidr:
+    Type: String
+    Default: 10.0.0.0/17
+    AllowedPattern: ((\d{1,3})\.){3}\d{1,3}/\d{1,2}
+
+  InstanceType:
+    Type: String
+    Default: t3.nano
+
+  InstanceAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Description: See https://aws.amazon.com/blogs/compute/query-for-the-latest-amazon-linux-ami-ids-using-aws-systems-manager-parameter-store/
+
+Conditions:
+  IsPrivate: !Equals [ !Ref SetupType, private ]
+  IsPublic: !Equals [ !Ref SetupType, public ]
+
+Resources:
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: !If [ IsPrivate, true, false ]
+      Tags:
+      - Key: Name
+        Value: !Ref AWS::StackName
+
+  IGW:
+    Condition: IsPublic
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: !Ref AWS::StackName
+
+  GatewayAttachment:
+    Condition: IsPublic
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref IGW
+      VpcId: !Ref VPC
+
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref SubnetCidr
+      MapPublicIpOnLaunch: !If [ IsPublic, true, false ]
+      Tags:
+      - Key: Name
+        Value: !Ref AWS::StackName
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Ref AWS::StackName
+
+  RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: 
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref Subnet
+
+  Route:
+    Condition: IsPublic
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+
+  VpcEndpointSG:
+    Condition: IsPrivate
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS from the subnet
+      VpcId: !Ref VPC
+      SecurityGroupIngress: 
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref SubnetCidr
+      Tags: 
+      - Key: Name
+        Value: !Ref AWS::StackName
+
+  VpcEndpointSsm:
+    Condition: IsPrivate
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref VPC
+      SubnetIds: 
+        - !Ref Subnet
+      SecurityGroupIds:
+        - !GetAtt VpcEndpointSG.GroupId
+
+  VpcEndpointSsmMessages:
+    Condition: IsPrivate
+    Type: AWS::EC2::VPCEndpoint
+    Properties: 
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref VPC
+      SubnetIds: 
+        - !Ref Subnet
+      SecurityGroupIds:
+        - !GetAtt VpcEndpointSG.GroupId
+
+  VpcEndpointEc2messages:
+    Condition: IsPrivate
+    Type: AWS::EC2::VPCEndpoint
+    Properties: 
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref VPC
+      SubnetIds: 
+        - !Ref Subnet
+      SecurityGroupIds:
+        - !GetAtt VpcEndpointSG.GroupId
+
+  # Required in order to support updating SSM Agent on the EC2 instance
+  VpcEndpointS3:
+    Condition: IsPrivate
+    Type: AWS::EC2::VPCEndpoint
+    Properties: 
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      VpcId: !Ref VPC
+      RouteTableIds:
+        - !Ref RouteTable
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: ec2.amazonaws.com
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+      - !Ref InstanceRole
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref InstanceAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref Subnet
+      IamInstanceProfile: !Ref InstanceProfile
+      Tags:
+      - Key: Name
+        Value: !Ref AWS::StackName
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
